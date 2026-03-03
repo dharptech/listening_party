@@ -5,6 +5,518 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Listening Party</title>
 <script src="https://www.youtube.com/iframe_api"></script>
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, update, onValue, push, serverTimestamp, remove }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDOthR_3Wm0r0olsYu1o-miRvoyI5Jj9Ho",
+    authDomain: "listening-party-b66f9.firebaseapp.com",
+    databaseURL: "https://listening-party-b66f9-default-rtdb.firebaseio.com",
+    projectId: "listening-party-b66f9",
+    storageBucket: "listening-party-b66f9.firebasestorage.app",
+    messagingSenderId: "501794449158",
+    appId: "1:501794449158:web:8e90c4d8ef804b1e4ee087"
+  };
+
+  const app = initializeApp(firebaseConfig);
+  const db = getDatabase(app);
+
+  // ── LOCAL STATE ────────────────────────────────────────────
+  const local = {
+    roomCode: null,
+    playerId: null,
+    playerName: null,
+    isHost: false,
+    progress: 0,
+    songDuration: 210,
+    songStartTime: null,
+    progressInterval: null,
+    pendingVideoId: null,
+    unsubscribers: [],
+  };
+
+  // ── HELPERS ────────────────────────────────────────────────
+  function roomRef(path = '') { return ref(db, `rooms/${local.roomCode}${path ? '/' + path : ''}`); }
+  function genId() { return Math.random().toString(36).substring(2, 10); }
+  function genCode() { return Math.random().toString(36).substring(2, 7).toUpperCase(); }
+
+  const COLORS = ['#2d6a4f','#1a4a8a','#7b2d8b','#b45309','#c0392b','#1a7a6e','#5a3e8a','#8a5c1a'];
+
+  // ── LANDING ────────────────────────────────────────────────
+  window.hostRoom = async function() {
+    const name = document.getElementById('host-name').value.trim();
+    if (!name) { toast('Enter your name first', 'red'); return; }
+
+    const code = genCode();
+    const playerId = genId();
+    local.roomCode = code;
+    local.playerId = playerId;
+    local.playerName = name;
+    local.isHost = true;
+
+    await set(roomRef(), {
+      code,
+      hostId: playerId,
+      createdAt: serverTimestamp(),
+      state: 'waiting',
+      currentSong: null,
+      songStartedAt: null,
+    });
+
+    await set(roomRef(`players/${playerId}`), {
+      name,
+      score: 0,
+      color: COLORS[0],
+      joinedAt: serverTimestamp(),
+    });
+
+    initApp();
+  };
+
+  window.joinRoom = async function() {
+    const name = document.getElementById('join-name').value.trim();
+    const code = document.getElementById('join-code').value.trim().toUpperCase();
+    if (!name) { toast('Enter your name first', 'red'); return; }
+    if (!code) { toast('Enter a room code', 'red'); return; }
+
+    // Check room exists
+    const snap = await get(ref(db, `rooms/${code}`));
+    if (!snap.exists()) { toast('Room not found', 'red'); return; }
+
+    const playerId = genId();
+    local.roomCode = code;
+    local.playerId = playerId;
+    local.playerName = name;
+    local.isHost = false;
+
+    // Pick a color not taken
+    const players = snap.val().players || {};
+    const taken = Object.values(players).map(p => p.color);
+    const color = COLORS.find(c => !taken.includes(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
+
+    await set(ref(db, `rooms/${code}/players/${playerId}`), {
+      name,
+      score: 0,
+      color,
+      joinedAt: serverTimestamp(),
+    });
+
+    initApp();
+  };
+
+  // ── INIT APP ───────────────────────────────────────────────
+  function initApp() {
+    document.getElementById('landing').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    document.getElementById('header-code').textContent = local.roomCode;
+    if (local.isHost) document.getElementById('host-btn').style.display = 'inline-flex';
+
+    // Show share info
+    document.getElementById('share-code').textContent = local.roomCode;
+
+    subscribeToRoom();
+    initYouTube();
+
+    // Clean up player on disconnect
+    import("https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js").then(({ onDisconnect }) => {
+      onDisconnect(roomRef(`players/${local.playerId}`)).remove();
+    });
+  }
+
+  // ── SUBSCRIBE ──────────────────────────────────────────────
+  let prevSong = null;
+  let prevSubmissions = {};
+
+  function subscribeToRoom() {
+    // Room state
+    const unsub1 = onValue(roomRef(), snap => {
+      if (!snap.exists()) return;
+      const room = snap.val();
+      renderRoom(room);
+    });
+    local.unsubscribers.push(unsub1);
+  }
+
+  function renderRoom(room) {
+    const players = room.players || {};
+    const submissions = room.submissions || {};
+    const currentSong = room.currentSong || null;
+
+    renderAvatars(players);
+    renderPlayerList(players, submissions);
+    renderTensionDots(players, submissions);
+    renderSubmitArea(submissions);
+    updateStatusChip(!!currentSong);
+
+    // Song changed
+    const songKey = currentSong ? currentSong.link + currentSong.submitterId : null;
+    const prevKey = prevSong ? prevSong.link + prevSong.submitterId : null;
+
+    if (songKey !== prevKey) {
+      if (currentSong) {
+        playSong(currentSong, players, room.songStartedAt);
+      } else {
+        stopSong();
+      }
+      prevSong = currentSong;
+    }
+
+    // Check majority (host only triggers the cut)
+    if (local.isHost && currentSong !== null) {
+      const playerCount = Object.keys(players).length;
+      const subCount = Object.keys(submissions).length;
+      const majority = Math.ceil(playerCount / 2);
+      if (subCount >= majority) {
+        // Debounce — only trigger once
+        if (!window._majorityTriggered) {
+          window._majorityTriggered = true;
+          setTimeout(() => triggerMajorityCut(players, submissions, currentSong), 800);
+        }
+      } else {
+        window._majorityTriggered = false;
+      }
+    }
+
+    // First song — if no current song and submissions hit majority, host starts first song
+    if (local.isHost && !currentSong) {
+      const playerCount = Object.keys(players).length;
+      const subCount = Object.keys(submissions).length;
+      const majority = Math.ceil(playerCount / 2);
+      if (subCount >= majority && !window._firstSongTriggered) {
+        window._firstSongTriggered = true;
+        setTimeout(() => triggerMajorityCut(players, submissions, null), 800);
+      } else if (subCount < majority) {
+        window._firstSongTriggered = false;
+      }
+    }
+
+    prevSubmissions = submissions;
+  }
+
+  // ── RENDER HELPERS ─────────────────────────────────────────
+  function renderAvatars(players) {
+    const row = document.getElementById('avatar-row');
+    row.innerHTML = Object.values(players).slice(0,6).map(p =>
+      `<div class="avatar" style="background:${p.color}">${p.name[0].toUpperCase()}</div>`
+    ).join('');
+  }
+
+  function renderPlayerList(players, submissions) {
+    const sorted = Object.entries(players).sort((a,b) => b[1].score - a[1].score);
+    const list = document.getElementById('player-list');
+    list.innerHTML = sorted.map(([pid, p], i) => `
+      <div class="player-row">
+        <div class="player-rank">${i+1}</div>
+        <div class="avatar-sm" style="background:${p.color}">${p.name[0].toUpperCase()}</div>
+        <div class="player-name ${pid === local.playerId ? 'is-you' : ''}">${p.name}</div>
+        <div class="player-submitted ${submissions[pid] ? 'active' : ''}"></div>
+        <div class="player-score">${p.score}</div>
+      </div>`).join('');
+  }
+
+  function renderTensionDots(players, submissions) {
+    const n = Object.keys(players).length;
+    const submitted = Object.keys(submissions).length;
+    const majority = Math.ceil(n / 2);
+    const wrap = document.getElementById('tension-dots');
+    wrap.innerHTML = Array.from({ length: n }, (_, i) => {
+      let cls = i < submitted ? (submitted >= majority ? 'active warning' : 'active') : '';
+      return `<div class="tension-dot ${cls}"></div>`;
+    }).join('');
+
+    const status = document.getElementById('tension-status');
+    if (submitted === 0) status.textContent = 'Nobody has submitted yet';
+    else if (submitted < majority) status.textContent = `${submitted} in — need ${majority - submitted} more to cut`;
+    else status.textContent = 'Majority reached — cutting…';
+  }
+
+  function renderSubmitArea(submissions) {
+    const mySub = submissions[local.playerId];
+    document.getElementById('submit-area').style.display = mySub ? 'none' : 'flex';
+    document.getElementById('submitted-state').style.display = mySub ? 'flex' : 'none';
+    if (mySub) document.getElementById('submitted-link-display').textContent = mySub.link;
+  }
+
+  function updateStatusChip(isPlaying) {
+    const wrap = document.getElementById('status-chip-wrap');
+    wrap.innerHTML = isPlaying
+      ? `<span class="status-chip live"><span class="dot-blink"></span> Live</span>`
+      : `<span class="status-chip waiting"><span class="dot-blink"></span> Waiting</span>`;
+  }
+
+  // ── SUBMIT SONG ────────────────────────────────────────────
+  window.submitSong = async function() {
+    const input = document.getElementById('link-input');
+    const link = input.value.trim();
+    if (!link) { toast('Paste a link first', 'red'); return; }
+
+    await set(roomRef(`submissions/${local.playerId}`), {
+      link,
+      playerName: local.playerName,
+      timestamp: Date.now(),
+    });
+
+    input.value = '';
+    toast('Locked in ✓', 'green');
+  };
+
+  window.cancelSubmission = async function() {
+    await remove(roomRef(`submissions/${local.playerId}`));
+  };
+
+  // ── MAJORITY CUT ───────────────────────────────────────────
+  async function triggerMajorityCut(players, submissions, currentSong) {
+    if (!local.isHost) return;
+
+    // Find earliest submission
+    let winnerId = null;
+    let earliest = Infinity;
+    for (const [pid, sub] of Object.entries(submissions)) {
+      if (sub.timestamp < earliest) { earliest = sub.timestamp; winnerId = pid; }
+    }
+    if (!winnerId) return;
+
+    const winnerSub = submissions[winnerId];
+    const winnerPlayer = players[winnerId];
+
+    // Award points
+    const updates = {};
+
+    if (currentSong) {
+      const djId = currentSong.submitterId;
+      const djPts = Math.floor(local.progress / 34);
+      const cutterPts = Math.floor(local.progress / 33) + 1;
+      if (djPts > 0) updates[`players/${djId}/score`] = (players[djId]?.score || 0) + djPts;
+      updates[`players/${winnerId}/score`] = (winnerPlayer?.score || 0) + cutterPts;
+    }
+
+    // Set new song, clear submissions
+    updates['currentSong'] = { link: winnerSub.link, submitterId: winnerId, submitterName: winnerPlayer?.name || '?' };
+    updates['songStartedAt'] = serverTimestamp();
+    updates['submissions'] = null;
+
+    await update(roomRef(), updates);
+
+    // Flash
+    const flash = document.getElementById('interrupt-flash');
+    flash.style.display = 'block';
+    setTimeout(() => flash.style.display = 'none', 500);
+
+    if (currentSong) toast(`${winnerPlayer?.name} cuts the song!`, 'red');
+  }
+
+  // ── PLAY SONG ──────────────────────────────────────────────
+  function playSong(song, players, songStartedAt) {
+    stopProgress();
+    local.progress = 0;
+
+    document.getElementById('no-song-state').style.display = 'none';
+    document.getElementById('song-state').style.display = 'flex';
+
+    document.getElementById('song-submitter').textContent = `submitted by ${song.submitterName}`;
+    const linkEl = document.getElementById('song-link');
+    linkEl.textContent = song.link;
+    linkEl.href = song.link;
+
+    const ytId = extractYouTubeId(song.link);
+
+    if (ytId) {
+      document.getElementById('yt-player-wrap').style.display = 'block';
+      document.getElementById('album-art').style.display = 'none';
+      document.getElementById('song-title').textContent = 'Loading…';
+
+      // Only host actually plays audio — clients show UI only
+      if (local.isHost) {
+        if (ytReady && ytPlayer && ytPlayer.loadVideoById) {
+          loadYTVideo(ytId);
+        } else {
+          local.pendingVideoId = ytId;
+        }
+      } else {
+        // Clients: sync progress to server timestamp
+        if (songStartedAt) {
+          const elapsed = (Date.now() - songStartedAt) / 1000;
+          local.songStartTime = Date.now() - elapsed * 1000;
+        } else {
+          local.songStartTime = Date.now();
+        }
+        startProgress();
+      }
+
+      fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(song.link)}&format=json`)
+        .then(r => r.json())
+        .then(d => { document.getElementById('song-title').textContent = d.title || 'YouTube Track'; })
+        .catch(() => { document.getElementById('song-title').textContent = 'YouTube Track'; });
+    } else {
+      document.getElementById('yt-player-wrap').style.display = 'none';
+      document.getElementById('album-art').style.display = 'flex';
+      let title = song.link;
+      try {
+        const u = new URL(song.link);
+        title = u.hostname.replace('www.','') + u.pathname;
+      } catch(e) {}
+      document.getElementById('song-title').textContent = title;
+      if (songStartedAt) local.songStartTime = Date.now() - ((Date.now() - songStartedAt));
+      else local.songStartTime = Date.now();
+      startProgress();
+    }
+  }
+
+  function stopSong() {
+    stopProgress();
+    if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
+    document.getElementById('no-song-state').style.display = 'flex';
+    document.getElementById('song-state').style.display = 'none';
+    document.getElementById('yt-player-wrap').style.display = 'none';
+    document.getElementById('album-art').style.display = 'flex';
+    document.getElementById('progress-fill').style.width = '0%';
+  }
+
+  // ── YOUTUBE ────────────────────────────────────────────────
+  let ytPlayer = null;
+  let ytReady = false;
+
+  function initYouTube() {
+    if (window.YT && window.YT.Player) {
+      createYTPlayer();
+    } else {
+      window.onYouTubeIframeAPIReady = createYTPlayer;
+    }
+  }
+
+  function createYTPlayer() {
+    ytReady = true;
+    ytPlayer = new YT.Player('yt-player', {
+      height: '100%', width: '100%', videoId: '',
+      playerVars: { autoplay: 1, controls: 1, rel: 0, modestbranding: 1 },
+      events: {
+        onStateChange: onYTStateChange,
+        onReady: () => { if (local.pendingVideoId) loadYTVideo(local.pendingVideoId); }
+      }
+    });
+  }
+
+  function onYTStateChange(e) {
+    if (e.data === YT.PlayerState.ENDED) hostCompleteSong();
+    if (e.data === YT.PlayerState.PLAYING) {
+      const dur = ytPlayer.getDuration();
+      if (dur) local.songDuration = dur;
+      startProgress();
+    }
+    if (e.data === YT.PlayerState.PAUSED) stopProgress();
+  }
+
+  function extractYouTubeId(url) {
+    try {
+      const u = new URL(url);
+      if (u.hostname.includes('youtu.be')) return u.pathname.slice(1).split('?')[0];
+      if (u.hostname.includes('youtube.com')) return u.searchParams.get('v');
+    } catch(e) {}
+    return null;
+  }
+
+  function loadYTVideo(videoId) {
+    local.pendingVideoId = null;
+    if (ytPlayer && ytPlayer.loadVideoById) ytPlayer.loadVideoById(videoId);
+  }
+
+  // ── PROGRESS ───────────────────────────────────────────────
+  function startProgress() {
+    stopProgress();
+    if (!local.songStartTime) local.songStartTime = Date.now();
+    local.progressInterval = setInterval(tickProgress, 500);
+  }
+
+  function stopProgress() {
+    if (local.progressInterval) { clearInterval(local.progressInterval); local.progressInterval = null; }
+  }
+
+  function tickProgress() {
+    let elapsed;
+    if (local.isHost && ytPlayer && ytPlayer.getCurrentTime && ytPlayer.getPlayerState?.() === 1) {
+      elapsed = ytPlayer.getCurrentTime();
+      const dur = ytPlayer.getDuration();
+      if (dur) local.songDuration = dur;
+    } else {
+      elapsed = (Date.now() - local.songStartTime) / 1000;
+    }
+
+    local.progress = Math.min((elapsed / local.songDuration) * 100, 100);
+    document.getElementById('progress-fill').style.width = local.progress + '%';
+
+    const s = Math.floor(elapsed);
+    document.getElementById('progress-time').textContent = `${Math.floor(s/60)}:${(s%60).toString().padStart(2,'0')}`;
+    const t = Math.floor(local.songDuration);
+    document.getElementById('progress-total').textContent = `${Math.floor(t/60)}:${(t%60).toString().padStart(2,'0')}`;
+
+    let pts = local.progress < 33 ? 1 : local.progress < 66 ? 2 : 3;
+    document.getElementById('points-preview').textContent = `+${pts} pts if survived`;
+
+    if (local.progress >= 100 && local.isHost) hostCompleteSong();
+  }
+
+  async function hostCompleteSong() {
+    if (!local.isHost) return;
+    stopProgress();
+
+    // Get current state to award points
+    const snap = await get(roomRef());
+    if (!snap.exists()) return;
+    const room = snap.val();
+    if (!room.currentSong) return;
+
+    const djId = room.currentSong.submitterId;
+    const players = room.players || {};
+    const updates = {};
+    updates[`players/${djId}/score`] = (players[djId]?.score || 0) + 3;
+    updates['currentSong'] = null;
+    updates['songStartedAt'] = null;
+    updates['submissions'] = null;
+    await update(roomRef(), updates);
+
+    toast(`${room.currentSong.submitterName}'s song played through! +3 pts`, 'green');
+    window._majorityTriggered = false;
+    window._firstSongTriggered = false;
+  }
+
+  // ── HOST CONTROLS ──────────────────────────────────────────
+  window.hostSkipSong = async function() {
+    if (!local.isHost) return;
+    const snap = await get(roomRef());
+    if (!snap.exists()) return;
+    const room = snap.val();
+    await update(roomRef(), { currentSong: null, songStartedAt: null, submissions: null });
+    if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
+    window._majorityTriggered = false;
+    window._firstSongTriggered = false;
+    toast('Song skipped');
+  };
+
+  window.hostResetScores = async function() {
+    if (!local.isHost) return;
+    const snap = await get(roomRef(`players`));
+    if (!snap.exists()) return;
+    const updates = {};
+    Object.keys(snap.val()).forEach(pid => updates[`${pid}/score`] = 0);
+    await update(roomRef('players'), updates);
+    toast('Scores reset');
+  };
+
+  // ── TOAST ──────────────────────────────────────────────────
+  window.toast = function(msg, type = '') {
+    const wrap = document.getElementById('toast-container');
+    const el = document.createElement('div');
+    el.className = `toast ${type}`;
+    el.textContent = msg;
+    wrap.appendChild(el);
+    setTimeout(() => el.remove(), 3000);
+  };
+
+  // make toast globally accessible
+  window._toast = window.toast;
+</script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&display=swap');
 
@@ -17,7 +529,6 @@
     --text: #1a1916;
     --text-2: #7a7770;
     --text-3: #b0aea8;
-    --accent: #1a1916;
     --green: #2d6a4f;
     --green-bg: #edf7f2;
     --red: #c0392b;
@@ -28,592 +539,126 @@
     --radius-sm: 8px;
   }
 
-  body {
-    font-family: 'DM Sans', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    font-size: 14px;
-    line-height: 1.5;
-  }
+  body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: 14px; line-height: 1.5; }
 
-  /* ── LANDING ── */
-  #landing {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    min-height: 100vh;
-    padding: 24px;
-    gap: 48px;
-  }
+  /* LANDING */
+  #landing { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; padding: 24px; gap: 48px; }
+  .wordmark { font-family: 'DM Mono', monospace; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--text-2); }
+  .landing-cards { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; max-width: 560px; width: 100%; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 28px; flex: 1; min-width: 220px; }
+  .card h2 { font-size: 15px; font-weight: 500; margin-bottom: 6px; }
+  .card p { font-size: 13px; color: var(--text-2); margin-bottom: 20px; line-height: 1.6; }
 
-  .wordmark {
-    font-family: 'DM Mono', monospace;
-    font-size: 13px;
-    font-weight: 400;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--text-2);
-  }
-
-  .landing-cards {
-    display: flex;
-    gap: 16px;
-    flex-wrap: wrap;
-    justify-content: center;
-    max-width: 560px;
-    width: 100%;
-  }
-
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 28px;
-    flex: 1;
-    min-width: 220px;
-  }
-
-  .card h2 {
-    font-size: 15px;
-    font-weight: 500;
-    margin-bottom: 6px;
-  }
-
-  .card p {
-    font-size: 13px;
-    color: var(--text-2);
-    margin-bottom: 20px;
-    line-height: 1.6;
-  }
-
-  .btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    padding: 10px 18px;
-    border-radius: var(--radius-sm);
-    font-family: 'DM Sans', sans-serif;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    border: none;
-    transition: opacity 0.15s, transform 0.1s;
-    width: 100%;
-    text-align: center;
-  }
+  /* BUTTONS */
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 10px 18px; border-radius: var(--radius-sm); font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 500; cursor: pointer; border: none; transition: opacity 0.15s, transform 0.1s; width: 100%; }
   .btn:active { transform: scale(0.98); }
-
-  .btn-dark {
-    background: var(--text);
-    color: #fff;
-  }
+  .btn-dark { background: var(--text); color: #fff; }
   .btn-dark:hover { opacity: 0.85; }
-
-  .btn-outline {
-    background: transparent;
-    color: var(--text);
-    border: 1px solid var(--border);
-  }
+  .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
   .btn-outline:hover { background: var(--bg); }
+  .btn-sm { padding: 7px 14px; font-size: 12px; width: auto; }
 
-  .btn-green {
-    background: var(--green);
-    color: #fff;
-  }
-  .btn-green:hover { opacity: 0.88; }
-
-  .btn-sm {
-    padding: 7px 14px;
-    font-size: 12px;
-    width: auto;
-  }
-
-  input[type="text"] {
-    width: 100%;
-    padding: 10px 12px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    font-family: 'DM Sans', sans-serif;
-    font-size: 13px;
-    background: var(--bg);
-    color: var(--text);
-    outline: none;
-    transition: border-color 0.15s;
-    margin-bottom: 10px;
-  }
+  input[type="text"] { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-family: 'DM Sans', sans-serif; font-size: 13px; background: var(--bg); color: var(--text); outline: none; transition: border-color 0.15s; margin-bottom: 10px; }
   input[type="text"]:focus { border-color: var(--text); }
   input[type="text"]::placeholder { color: var(--text-3); }
 
-  /* ── LAYOUT ── */
+  /* APP */
   #app { display: none; }
-  #app.active { display: block; }
+  .app-shell { display: grid; grid-template-columns: 1fr; max-width: 1100px; margin: 0 auto; padding: 20px; gap: 16px; }
+  @media (min-width: 700px) { .app-shell { grid-template-columns: 1fr 320px; padding: 24px; } }
 
-  .app-shell {
-    display: grid;
-    grid-template-columns: 1fr;
-    min-height: 100vh;
-    max-width: 1100px;
-    margin: 0 auto;
-    padding: 20px;
-    gap: 16px;
-  }
-
-  @media (min-width: 700px) {
-    .app-shell {
-      grid-template-columns: 1fr 320px;
-      grid-template-rows: auto 1fr;
-      padding: 24px;
-    }
-  }
-
-  /* ── HEADER ── */
-  .app-header {
-    grid-column: 1 / -1;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 16px 20px;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-  }
-
-  .room-info { display: flex; align-items: center; gap: 12px; }
-  .room-code {
-    font-family: 'DM Mono', monospace;
-    font-size: 12px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    padding: 4px 10px;
-    border-radius: 6px;
-    color: var(--text-2);
-    letter-spacing: 0.08em;
-  }
-
-  .players-pill {
-    display: flex;
-    align-items: center;
-    gap: -4px;
-  }
-
-  .avatar {
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    border: 2px solid var(--surface);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 11px;
-    font-weight: 500;
-    margin-left: -6px;
-    color: #fff;
-  }
+  /* HEADER */
+  .app-header { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); flex-wrap: wrap; gap: 10px; }
+  .room-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .room-code { font-family: 'DM Mono', monospace; font-size: 12px; background: var(--bg); border: 1px solid var(--border); padding: 4px 10px; border-radius: 6px; color: var(--text-2); letter-spacing: 0.08em; }
+  .share-hint { font-size: 12px; color: var(--text-3); }
+  .avatar { width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--surface); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; margin-left: -6px; color: #fff; }
   .avatar:first-child { margin-left: 0; }
+  .avatar-sm { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; color: #fff; flex-shrink: 0; }
+  #avatar-row { display: flex; }
 
-  /* ── NOW PLAYING ── */
-  .now-playing {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-  }
+  /* SECTION LABEL */
+  .section-label { font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: 0.15em; text-transform: uppercase; color: var(--text-3); margin-bottom: 4px; }
 
-  .section-label {
-    font-family: 'DM Mono', monospace;
-    font-size: 10px;
-    letter-spacing: 0.15em;
-    text-transform: uppercase;
-    color: var(--text-3);
-    margin-bottom: 4px;
-  }
+  /* NOW PLAYING */
+  .now-playing { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; display: flex; flex-direction: column; gap: 20px; }
+  .no-song-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 40px 20px; text-align: center; color: var(--text-3); min-height: 160px; }
+  #song-state { display: none; flex-direction: column; gap: 20px; }
+  #yt-player-wrap { width: 100%; aspect-ratio: 16/9; border-radius: 8px; overflow: hidden; background: #000; display: none; }
+  #yt-player { width: 100%; height: 100%; }
 
-  .song-display {
-    display: flex;
-    gap: 16px;
-    align-items: flex-start;
-  }
-
-  .album-art {
-    width: 72px;
-    height: 72px;
-    border-radius: 8px;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 28px;
-    position: relative;
-    overflow: hidden;
-  }
-
-  .album-art.playing::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    border-radius: 8px;
-    border: 2px solid var(--text);
-    animation: pulse-border 2s ease-in-out infinite;
-  }
-
-  @keyframes pulse-border {
-    0%, 100% { opacity: 0.15; }
-    50% { opacity: 0.5; }
-  }
-
+  .song-display { display: flex; gap: 16px; align-items: flex-start; }
+  .album-art { width: 72px; height: 72px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 28px; position: relative; overflow: hidden; }
+  .album-art::after { content: ''; position: absolute; inset: 0; border-radius: 8px; border: 2px solid var(--text); animation: pulse-border 2s ease-in-out infinite; }
+  @keyframes pulse-border { 0%,100%{opacity:.1} 50%{opacity:.4} }
   .song-meta { flex: 1; min-width: 0; }
-  .song-title {
-    font-size: 16px;
-    font-weight: 500;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .song-submitter {
-    font-size: 13px;
-    color: var(--text-2);
-    margin-top: 2px;
-  }
-  .song-link {
-    font-family: 'DM Mono', monospace;
-    font-size: 11px;
-    color: var(--text-3);
-    margin-top: 6px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    display: block;
-  }
+  .song-title { font-size: 16px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .song-submitter { font-size: 13px; color: var(--text-2); margin-top: 2px; }
+  .song-link { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text-3); margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
 
-  /* ── PROGRESS ── */
+  /* PROGRESS */
   .progress-wrap { display: flex; flex-direction: column; gap: 8px; }
+  .progress-bar-bg { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .progress-bar-fill { height: 100%; background: var(--text); border-radius: 2px; transition: width 0.5s linear; }
+  .progress-meta { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--text-2); }
+  .points-preview { font-family: 'DM Mono', monospace; font-size: 11px; padding: 2px 8px; border-radius: 4px; background: var(--amber-bg); color: var(--amber); }
 
-  .progress-bar-bg {
-    height: 3px;
-    background: var(--border);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-  .progress-bar-fill {
-    height: 100%;
-    background: var(--text);
-    border-radius: 2px;
-    transition: width 0.5s linear;
-  }
+  /* TENSION */
+  .tension-wrap { display: flex; flex-direction: column; gap: 8px; }
+  .tension-label-row { display: flex; justify-content: space-between; align-items: center; }
+  .tension-dots { display: flex; gap: 6px; }
+  .tension-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); transition: background 0.3s, transform 0.3s; }
+  .tension-dot.active { background: var(--text); transform: scale(1.2); }
+  .tension-dot.warning { background: var(--amber); animation: dot-pulse 0.8s ease-in-out infinite alternate; }
+  @keyframes dot-pulse { from{transform:scale(1)} to{transform:scale(1.4)} }
+  .tension-status { font-size: 12px; color: var(--text-2); font-style: italic; }
 
-  .progress-meta {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 12px;
-    color: var(--text-2);
-  }
-
-  .points-preview {
-    font-family: 'DM Mono', monospace;
-    font-size: 11px;
-    padding: 2px 8px;
-    border-radius: 4px;
-    background: var(--amber-bg);
-    color: var(--amber);
-  }
-
-  /* ── TENSION METER ── */
-  .tension-wrap {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .tension-label-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
-  .tension-dots {
-    display: flex;
-    gap: 6px;
-  }
-
-  .tension-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--border);
-    transition: background 0.3s, transform 0.3s;
-  }
-
-  .tension-dot.active {
-    background: var(--text);
-    transform: scale(1.2);
-  }
-
-  .tension-dot.warning {
-    background: var(--amber);
-    animation: dot-pulse 0.8s ease-in-out infinite alternate;
-  }
-
-  @keyframes dot-pulse {
-    from { transform: scale(1); }
-    to { transform: scale(1.4); }
-  }
-
-  .tension-status {
-    font-size: 12px;
-    color: var(--text-2);
-    font-style: italic;
-  }
-
-  /* ── SIDEBAR ── */
-  .sidebar {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-
-  /* ── MY SUBMISSION ── */
-  .my-submission {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 20px;
-  }
-
+  /* SIDEBAR */
+  .sidebar { display: flex; flex-direction: column; gap: 16px; }
+  .my-submission { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
   .submit-area { display: flex; flex-direction: column; gap: 10px; }
+  .submitted-state { display: none; flex-direction: column; gap: 10px; }
+  .submitted-badge { display: flex; align-items: center; gap: 8px; padding: 10px 12px; background: var(--green-bg); border: 1px solid #b7e4cc; border-radius: var(--radius-sm); font-size: 13px; color: var(--green); font-weight: 500; }
+  .submitted-link { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-  .submitted-state {
-    display: none;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .submitted-badge {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 12px;
-    background: var(--green-bg);
-    border: 1px solid #b7e4cc;
-    border-radius: var(--radius-sm);
-    font-size: 13px;
-    color: var(--green);
-    font-weight: 500;
-  }
-
-  .submitted-link {
-    font-family: 'DM Mono', monospace;
-    font-size: 11px;
-    color: var(--text-3);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  /* ── LEADERBOARD ── */
-  .leaderboard {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 20px;
-  }
-
-  .player-row {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 8px 0;
-    border-bottom: 1px solid var(--border);
-  }
+  /* LEADERBOARD */
+  .leaderboard { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .player-row { display: flex; align-items: center; gap: 8px; padding: 8px 0; border-bottom: 1px solid var(--border); }
   .player-row:last-child { border-bottom: none; }
-
-  .player-rank {
-    font-family: 'DM Mono', monospace;
-    font-size: 11px;
-    color: var(--text-3);
-    width: 16px;
-    text-align: center;
-  }
-
-  .player-name { flex: 1; font-size: 13px; font-weight: 400; }
+  .player-rank { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--text-3); width: 16px; text-align: center; }
+  .player-name { flex: 1; font-size: 13px; }
   .player-name.is-you { font-weight: 500; }
-  .player-name.is-you::after {
-    content: ' (you)';
-    font-weight: 300;
-    color: var(--text-2);
-  }
-
-  .player-score {
-    font-family: 'DM Mono', monospace;
-    font-size: 13px;
-    font-weight: 500;
-  }
-
-  .player-submitted {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--border);
-    transition: background 0.3s;
-  }
+  .player-name.is-you::after { content: ' (you)'; font-weight: 300; color: var(--text-2); }
+  .player-score { font-family: 'DM Mono', monospace; font-size: 13px; font-weight: 500; }
+  .player-submitted { width: 8px; height: 8px; border-radius: 50%; background: var(--border); transition: background 0.3s; }
   .player-submitted.active { background: var(--green); }
 
-  /* ── TOAST ── */
-  #toast-container {
-    position: fixed;
-    bottom: 24px;
-    left: 50%;
-    transform: translateX(-50%);
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    z-index: 100;
-    pointer-events: none;
-  }
+  /* HOST PANEL */
+  .host-panel { grid-column: 1/-1; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+  .host-panel h3 { font-size: 13px; font-weight: 500; margin-bottom: 12px; }
+  .host-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
-  .toast {
-    background: var(--text);
-    color: #fff;
-    padding: 10px 18px;
-    border-radius: 8px;
-    font-size: 13px;
-    white-space: nowrap;
-    animation: toast-in 0.2s ease, toast-out 0.3s ease 2.5s forwards;
-  }
+  /* STATUS CHIPS */
+  .status-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 500; }
+  .status-chip.live { background: var(--red-bg); color: var(--red); }
+  .status-chip.waiting { background: var(--amber-bg); color: var(--amber); }
+  .dot-blink { width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: blink 1.2s ease-in-out infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
 
+  /* TOAST */
+  #toast-container { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 100; pointer-events: none; }
+  .toast { background: var(--text); color: #fff; padding: 10px 18px; border-radius: 8px; font-size: 13px; white-space: nowrap; animation: toast-in 0.2s ease, toast-out 0.3s ease 2.5s forwards; }
   .toast.green { background: var(--green); }
   .toast.red { background: var(--red); }
+  @keyframes toast-in { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes toast-out { from{opacity:1} to{opacity:0} }
 
-  @keyframes toast-in {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  @keyframes toast-out {
-    from { opacity: 1; }
-    to { opacity: 0; pointer-events: none; }
-  }
+  /* INTERRUPT FLASH */
+  .interrupt-flash { display: none; position: fixed; inset: 0; background: rgba(192,57,43,0.07); z-index: 50; pointer-events: none; animation: flash 0.5s ease forwards; }
+  @keyframes flash { 0%{opacity:1} 100%{opacity:0} }
 
-  /* ── INTERRUPT FLASH ── */
-  .interrupt-flash {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(192, 57, 43, 0.06);
-    z-index: 50;
-    pointer-events: none;
-    animation: flash 0.5s ease forwards;
-  }
-  @keyframes flash {
-    0% { opacity: 1; }
-    100% { opacity: 0; }
-  }
-
-  /* ── EMPTY STATE ── */
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    padding: 40px 20px;
-    text-align: center;
-    color: var(--text-3);
-  }
-
-  .empty-icon { font-size: 32px; margin-bottom: 4px; }
-
-  /* ── PLAYER DEMO SWITCHER (prototype only) ── */
-  .demo-bar {
-    grid-column: 1 / -1;
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 12px 20px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .demo-label {
-    font-family: 'DM Mono', monospace;
-    font-size: 10px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--text-3);
-  }
-
-  .demo-player-btn {
-    padding: 5px 12px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: transparent;
-    font-family: 'DM Sans', sans-serif;
-    font-size: 12px;
-    cursor: pointer;
-    color: var(--text-2);
-    transition: all 0.15s;
-  }
-  .demo-player-btn.active {
-    background: var(--text);
-    color: #fff;
-    border-color: var(--text);
-  }
-
-  /* ── NO SONG ── */
-  .no-song-state {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    padding: 32px;
-    text-align: center;
-    color: var(--text-3);
-    min-height: 160px;
-  }
-
-  .status-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 3px 10px;
-    border-radius: 20px;
-    font-size: 11px;
-    font-weight: 500;
-  }
-
-  .status-chip.live {
-    background: var(--red-bg);
-    color: var(--red);
-  }
-
-  .status-chip.waiting {
-    background: var(--amber-bg);
-    color: var(--amber);
-  }
-
-  .dot-blink {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: currentColor;
-    animation: blink 1.2s ease-in-out infinite;
-  }
-
-  @keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
+  /* CLIENT NOTICE */
+  .client-notice { background: var(--amber-bg); border: 1px solid #f0d080; border-radius: var(--radius-sm); padding: 10px 14px; font-size: 12px; color: var(--amber); }
 </style>
 </head>
 <body>
@@ -621,20 +666,19 @@
 <!-- LANDING -->
 <div id="landing">
   <div class="wordmark">Listening Party</div>
-
   <div class="landing-cards">
     <div class="card">
       <h2>Host a room</h2>
-      <p>Start a session. Share the room code with friends.</p>
+      <p>Start a session and share the room code with friends.</p>
       <input type="text" id="host-name" placeholder="Your name" />
-      <button class="btn btn-dark" onclick="hostRoom()">Create room</button>
+      <button class="btn btn-dark" onclick="hostRoom()">Create room →</button>
     </div>
     <div class="card">
       <h2>Join a room</h2>
       <p>Enter the code your host shared with you.</p>
       <input type="text" id="join-name" placeholder="Your name" />
-      <input type="text" id="join-code" placeholder="Room code" style="text-transform:uppercase;" />
-      <button class="btn btn-outline" onclick="joinRoom()">Join room</button>
+      <input type="text" id="join-code" placeholder="Room code" style="text-transform:uppercase" />
+      <button class="btn btn-outline" onclick="joinRoom()">Join room →</button>
     </div>
   </div>
 </div>
@@ -648,41 +692,29 @@
       <div class="room-info">
         <span class="wordmark">Listening Party</span>
         <span class="room-code" id="header-code"></span>
+        <span class="share-hint">share this code to invite friends</span>
         <div id="status-chip-wrap"></div>
       </div>
       <div style="display:flex;align-items:center;gap:10px;">
-        <div class="players-pill" id="avatar-row"></div>
-        <button class="btn btn-outline btn-sm" id="host-controls-btn" style="display:none" onclick="toggleHostControls()">⚙ Host</button>
+        <div id="avatar-row"></div>
+        <button class="btn btn-outline btn-sm" id="host-btn" style="display:none" onclick="toggleHostPanel()">⚙ Host</button>
       </div>
-    </div>
-
-    <!-- DEMO BAR (prototype helper) -->
-    <div class="demo-bar">
-      <span class="demo-label">Viewing as →</span>
-      <div id="demo-player-buttons"></div>
     </div>
 
     <!-- NOW PLAYING -->
     <div class="now-playing">
-      <div>
-        <div class="section-label">Now playing</div>
-      </div>
+      <div class="section-label">Now playing</div>
 
-      <!-- No song yet -->
       <div class="no-song-state" id="no-song-state">
-        <div style="font-size:28px;">♫</div>
+        <div style="font-size:32px;">♫</div>
         <div style="font-size:14px;color:var(--text-2);">Waiting for the first song…</div>
-        <div style="font-size:12px;">Submit a link to kick things off</div>
+        <div style="font-size:12px;">Submit a YouTube link to kick things off</div>
       </div>
 
-      <!-- Song playing -->
-      <div id="song-state" style="display:none;flex-direction:column;gap:20px;">
-        <!-- YouTube player -->
-        <div id="yt-player-wrap" style="width:100%;aspect-ratio:16/9;border-radius:8px;overflow:hidden;background:#000;display:none;">
-          <div id="yt-player"></div>
-        </div>
+      <div id="song-state">
+        <div id="yt-player-wrap"><div id="yt-player"></div></div>
         <div class="song-display">
-          <div class="album-art playing" id="album-art" style="display:flex;">♪</div>
+          <div class="album-art" id="album-art" style="display:none;">♪</div>
           <div class="song-meta">
             <div class="song-title" id="song-title">—</div>
             <div class="song-submitter" id="song-submitter"></div>
@@ -691,20 +723,18 @@
         </div>
 
         <div class="progress-wrap">
-          <div class="progress-bar-bg">
-            <div class="progress-bar-fill" id="progress-fill" style="width:0%"></div>
-          </div>
+          <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill" style="width:0%"></div></div>
           <div class="progress-meta">
             <span id="progress-time">0:00</span>
-            <span class="points-preview" id="points-preview">+0 pts if cut now</span>
-            <span id="progress-total">3:30</span>
+            <span class="points-preview" id="points-preview">+0 pts</span>
+            <span id="progress-total">0:00</span>
           </div>
         </div>
 
         <div class="tension-wrap">
           <div class="tension-label-row">
-            <span class="section-label" style="margin:0;">Submissions</span>
-            <span class="tension-status" id="tension-status">Waiting…</span>
+            <span class="section-label" style="margin:0">Submissions</span>
+            <span class="tension-status" id="tension-status"></span>
           </div>
           <div class="tension-dots" id="tension-dots"></div>
         </div>
@@ -714,557 +744,47 @@
     <!-- SIDEBAR -->
     <div class="sidebar">
 
-      <!-- MY SUBMISSION -->
       <div class="my-submission">
         <div class="section-label">My pick</div>
-
         <div class="submit-area" id="submit-area">
-          <input type="text" id="link-input" placeholder="Paste any music link…" />
+          <input type="text" id="link-input" placeholder="Paste a YouTube link…" />
           <button class="btn btn-dark" onclick="submitSong()">Lock in ↵</button>
         </div>
-
         <div class="submitted-state" id="submitted-state">
-          <div class="submitted-badge">
-            <span>✓</span> Locked in
-          </div>
+          <div class="submitted-badge">✓ Locked in</div>
           <div class="submitted-link" id="submitted-link-display"></div>
           <button class="btn btn-outline btn-sm" onclick="cancelSubmission()" style="width:100%">Change pick</button>
         </div>
       </div>
 
-      <!-- LEADERBOARD -->
       <div class="leaderboard">
         <div class="section-label">Players</div>
-        <div id="player-list"></div>
+        <div id="player-list"><div style="color:var(--text-3);font-size:13px;padding:12px 0;">Waiting for players…</div></div>
       </div>
 
     </div>
 
-    <!-- HOST CONTROLS (hidden by default) -->
-    <div id="host-panel" style="display:none;grid-column:1/-1;">
-      <div class="card">
-        <h2>Host controls</h2>
-        <p>Simulate game actions for demo purposes.</p>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;">
-          <button class="btn btn-outline btn-sm" onclick="simulateProgress()" style="width:auto">▶ Advance song 10%</button>
-          <button class="btn btn-outline btn-sm" onclick="simulateOtherSubmit()" style="width:auto">👤 Other player submits</button>
-          <button class="btn btn-outline btn-sm" onclick="forceMajority()" style="width:auto">⚡ Trigger majority cut</button>
-          <button class="btn btn-outline btn-sm" onclick="completeSong()" style="width:auto">✓ Complete song</button>
-          <button class="btn btn-outline btn-sm" onclick="resetRound()" style="width:auto">↺ Reset round</button>
-        </div>
+    <!-- HOST PANEL -->
+    <div class="host-panel" id="host-panel" style="display:none;">
+      <h3>Host controls</h3>
+      <div class="host-actions">
+        <button class="btn btn-outline btn-sm" onclick="hostSkipSong()">⏭ Skip song</button>
+        <button class="btn btn-outline btn-sm" onclick="hostResetScores()">↺ Reset scores</button>
       </div>
     </div>
 
   </div>
 </div>
 
-<!-- INTERRUPT FLASH -->
 <div class="interrupt-flash" id="interrupt-flash"></div>
-
-<!-- TOAST -->
 <div id="toast-container"></div>
 
 <script>
-// ── STATE ──────────────────────────────────────────────────
-const COLORS = ['#2d6a4f','#1a4a8a','#7b2d8b','#b45309','#c0392b','#1a7a6e'];
-
-let state = {
-  roomCode: '',
-  isHost: false,
-  currentPlayer: null, // which player perspective we're viewing
-  players: [],
-  currentSong: null,
-  submissions: {}, // playerId -> { link, timestamp }
-  progress: 0, // 0–100
-  progressInterval: null,
-  songDuration: 210, // seconds (3:30)
-  songStartTime: null,
-};
-
-// ── DEMO PLAYERS ──────────────────────────────────────────
-const DEMO_PLAYERS = [
-  { id: 'p1', name: 'Alex', score: 0 },
-  { id: 'p2', name: 'Jordan', score: 0 },
-  { id: 'p3', name: 'Sam', score: 0 },
-  { id: 'p4', name: 'Riley', score: 0 },
-];
-
-// ── LANDING ───────────────────────────────────────────────
-function hostRoom() {
-  const name = document.getElementById('host-name').value.trim() || 'Host';
-  const code = Math.random().toString(36).substring(2,7).toUpperCase();
-  initApp(code, name, true);
-}
-
-function joinRoom() {
-  const name = document.getElementById('join-name').value.trim() || 'Guest';
-  const code = document.getElementById('join-code').value.trim().toUpperCase() || 'DEMO1';
-  initApp(code, name, false);
-}
-
-// ── INIT ──────────────────────────────────────────────────
-function initApp(code, myName, isHost) {
-  state.roomCode = code;
-  state.isHost = isHost;
-
-  // Add demo players + current user
-  state.players = DEMO_PLAYERS.map(p => ({ ...p, score: 0 }));
-  // Replace first player with the actual user
-  state.players[0] = { id: 'me', name: myName, score: 0 };
-  state.currentPlayer = 'me';
-
-  document.getElementById('landing').style.display = 'none';
-  const app = document.getElementById('app');
-  app.style.display = 'block';
-  app.classList.add('active');
-
-  document.getElementById('header-code').textContent = code;
-  if (isHost) document.getElementById('host-controls-btn').style.display = 'flex';
-
-  renderDemoBar();
-  renderAvatars();
-  renderPlayerList();
-  renderTensionDots();
-  updateStatusChip(false);
-}
-
-// ── DEMO BAR ──────────────────────────────────────────────
-function renderDemoBar() {
-  const wrap = document.getElementById('demo-player-buttons');
-  wrap.innerHTML = state.players.map(p =>
-    `<button class="demo-player-btn ${p.id === state.currentPlayer ? 'active' : ''}"
-      onclick="switchPlayer('${p.id}')">${p.name}</button>`
-  ).join('');
-}
-
-function switchPlayer(id) {
-  // Save current submission state before switching
-  state.currentPlayer = id;
-  renderDemoBar();
-  renderSubmitArea();
-  renderPlayerList();
-}
-
-// ── AVATARS ───────────────────────────────────────────────
-function renderAvatars() {
-  const row = document.getElementById('avatar-row');
-  row.innerHTML = state.players.slice(0,5).map((p,i) =>
-    `<div class="avatar" style="background:${COLORS[i % COLORS.length]}">${p.name[0]}</div>`
-  ).join('');
-}
-
-// ── PLAYER LIST ───────────────────────────────────────────
-function renderPlayerList() {
-  const sorted = [...state.players].sort((a,b) => b.score - a.score);
-  const list = document.getElementById('player-list');
-
-  if (sorted.length === 0) {
-    list.innerHTML = '<div class="empty-state"><div class="empty-icon">👤</div><div>No players yet</div></div>';
-    return;
+  let hostPanelOpen = false;
+  function toggleHostPanel() {
+    hostPanelOpen = !hostPanelOpen;
+    document.getElementById('host-panel').style.display = hostPanelOpen ? 'block' : 'none';
   }
-
-  list.innerHTML = sorted.map((p, i) => {
-    const hasSubmitted = !!state.submissions[p.id];
-    return `
-    <div class="player-row">
-      <div class="player-rank">${i+1}</div>
-      <div class="player-name ${p.id === state.currentPlayer ? 'is-you' : ''}">${p.name}</div>
-      <div class="player-submitted ${hasSubmitted ? 'active' : ''}"></div>
-      <div class="player-score">${p.score}</div>
-    </div>`;
-  }).join('');
-}
-
-// ── TENSION DOTS ──────────────────────────────────────────
-function renderTensionDots() {
-  const wrap = document.getElementById('tension-dots');
-  const n = state.players.length;
-  const submitted = Object.keys(state.submissions).length;
-  const majority = Math.ceil(n / 2);
-
-  wrap.innerHTML = Array.from({ length: n }, (_, i) => {
-    let cls = '';
-    if (i < submitted) cls = submitted >= majority ? 'active warning' : 'active';
-    return `<div class="tension-dot ${cls}"></div>`;
-  }).join('');
-
-  const status = document.getElementById('tension-status');
-  if (submitted === 0) {
-    status.textContent = 'Nobody has submitted yet';
-  } else if (submitted < majority) {
-    status.textContent = `${submitted} submitted — need ${majority - submitted} more to cut`;
-  } else {
-    status.textContent = `Majority reached — cutting soon…`;
-  }
-}
-
-// ── STATUS CHIP ───────────────────────────────────────────
-function updateStatusChip(isPlaying) {
-  const wrap = document.getElementById('status-chip-wrap');
-  if (isPlaying) {
-    wrap.innerHTML = `<span class="status-chip live"><span class="dot-blink"></span> Live</span>`;
-  } else {
-    wrap.innerHTML = `<span class="status-chip waiting"><span class="dot-blink"></span> Waiting</span>`;
-  }
-}
-
-// ── SUBMIT SONG ───────────────────────────────────────────
-function submitSong() {
-  const input = document.getElementById('link-input');
-  const link = input.value.trim();
-  if (!link) { toast('Paste a link first', 'red'); return; }
-
-  const player = state.currentPlayer;
-  const ts = Date.now();
-
-  state.submissions[player] = { link, timestamp: ts };
-  input.value = '';
-
-  renderSubmitArea();
-  renderPlayerList();
-  renderTensionDots();
-
-  const majority = Math.ceil(state.players.length / 2);
-  const count = Object.keys(state.submissions).length;
-
-  toast('Locked in ✓', 'green');
-
-  if (count >= majority) {
-    setTimeout(() => triggerMajorityCut(), 800);
-  }
-}
-
-function cancelSubmission() {
-  delete state.submissions[state.currentPlayer];
-  renderSubmitArea();
-  renderPlayerList();
-  renderTensionDots();
-}
-
-function renderSubmitArea() {
-  const sub = state.submissions[state.currentPlayer];
-  const submitArea = document.getElementById('submit-area');
-  const submittedState = document.getElementById('submitted-state');
-
-  if (sub) {
-    submitArea.style.display = 'none';
-    submittedState.style.display = 'flex';
-    document.getElementById('submitted-link-display').textContent = sub.link;
-  } else {
-    submitArea.style.display = 'flex';
-    submittedState.style.display = 'none';
-  }
-}
-
-// ── MAJORITY CUT ──────────────────────────────────────────
-function triggerMajorityCut() {
-  // Find earliest submission
-  let winner = null;
-  let earliest = Infinity;
-  for (const [pid, sub] of Object.entries(state.submissions)) {
-    if (sub.timestamp < earliest) {
-      earliest = sub.timestamp;
-      winner = pid;
-    }
-  }
-
-  if (!winner) return;
-
-  const winnerPlayer = state.players.find(p => p.id === winner);
-  const winnerSub = state.submissions[winner];
-
-  // Flash interrupt
-  const flash = document.getElementById('interrupt-flash');
-  flash.style.display = 'block';
-  setTimeout(() => flash.style.display = 'none', 500);
-
-  // Award cut points to winner
-  if (state.currentSong) {
-    const cutterScore = Math.floor(state.progress / 33) + 1;
-    const djPlayer = state.players.find(p => p.id === state.currentSong.submitterId);
-    if (djPlayer) {
-      const djPts = Math.floor(state.progress / 34);
-      djPlayer.score += djPts;
-    }
-    winnerPlayer.score += cutterScore;
-    toast(`${winnerPlayer.name} cuts the song! +${cutterScore} pts`, 'red');
-  }
-
-  // Reset all other submissions
-  const allSubs = { ...state.submissions };
-  state.submissions = {};
-
-  // Play winner's song
-  playSong(winnerSub.link, winner);
-  renderSubmitArea();
-  renderPlayerList();
-  renderTensionDots();
-}
-
-// ── YOUTUBE API ───────────────────────────────────────────
-let ytPlayer = null;
-let ytReady = false;
-
-window.onYouTubeIframeAPIReady = function() {
-  ytReady = true;
-  ytPlayer = new YT.Player('yt-player', {
-    height: '100%',
-    width: '100%',
-    videoId: '',
-    playerVars: { autoplay: 1, controls: 1, rel: 0, modestbranding: 1 },
-    events: {
-      onStateChange: onYTStateChange,
-      onReady: () => { if (state.pendingVideoId) loadYTVideo(state.pendingVideoId); }
-    }
-  });
-};
-
-function onYTStateChange(event) {
-  if (event.data === YT.PlayerState.ENDED) {
-    completeSong();
-  }
-  if (event.data === YT.PlayerState.PLAYING) {
-    const dur = ytPlayer.getDuration();
-    if (dur) state.songDuration = dur;
-    startProgress();
-  }
-  if (event.data === YT.PlayerState.PAUSED) {
-    stopProgress();
-  }
-}
-
-function extractYouTubeId(url) {
-  try {
-    const u = new URL(url);
-    if (u.hostname.includes('youtu.be')) return u.pathname.slice(1).split('?')[0];
-    if (u.hostname.includes('youtube.com')) return u.searchParams.get('v');
-  } catch(e) {}
-  return null;
-}
-
-function loadYTVideo(videoId) {
-  state.pendingVideoId = null;
-  if (ytPlayer && ytPlayer.loadVideoById) {
-    ytPlayer.loadVideoById(videoId);
-  }
-}
-
-// ── PLAY SONG ─────────────────────────────────────────────
-function playSong(link, submitterId) {
-  stopProgress();
-
-  const player = state.players.find(p => p.id === submitterId);
-  state.currentSong = { link, submitterId, startTime: Date.now() };
-  state.progress = 0;
-
-  document.getElementById('no-song-state').style.display = 'none';
-  const ss = document.getElementById('song-state');
-  ss.style.display = 'flex';
-
-  const linkEl = document.getElementById('song-link');
-  linkEl.textContent = link;
-  linkEl.href = link;
-
-  const ytId = extractYouTubeId(link);
-
-  if (ytId) {
-    // Show YouTube player, hide album art
-    document.getElementById('yt-player-wrap').style.display = 'block';
-    document.getElementById('album-art').style.display = 'none';
-    document.getElementById('song-title').textContent = 'Loading…';
-    document.getElementById('song-submitter').textContent = `submitted by ${player?.name || 'Unknown'}`;
-
-    if (ytReady && ytPlayer && ytPlayer.loadVideoById) {
-      loadYTVideo(ytId);
-    } else {
-      state.pendingVideoId = ytId;
-    }
-
-    // Fetch title via oEmbed (no API key needed)
-    fetch(`https://www.youtube.com/oembed?url=${encodeURIComponent(link)}&format=json`)
-      .then(r => r.json())
-      .then(d => { document.getElementById('song-title').textContent = d.title || 'YouTube Track'; })
-      .catch(() => { document.getElementById('song-title').textContent = 'YouTube Track'; });
-
-  } else {
-    // Non-YouTube link — show album art placeholder, no audio
-    document.getElementById('yt-player-wrap').style.display = 'none';
-    document.getElementById('album-art').style.display = 'flex';
-
-    let title = 'Unknown Track';
-    try {
-      const url = new URL(link);
-      const host = url.hostname.replace('www.','').replace('open.','');
-      const parts = url.pathname.split('/').filter(Boolean);
-      title = `${host} / ${parts[parts.length-1] || 'track'}`;
-    } catch(e) {
-      title = link.length > 40 ? link.substring(0,40)+'…' : link;
-    }
-    document.getElementById('song-title').textContent = title;
-    document.getElementById('song-submitter').textContent = `submitted by ${player?.name || 'Unknown'}`;
-    toast('Non-YouTube link — open manually on speaker', '');
-    startProgress();
-  }
-
-  updateStatusChip(true);
-}
-
-// ── PROGRESS ──────────────────────────────────────────────
-function startProgress() {
-  stopProgress();
-  state.songStartTime = Date.now();
-  state.progressInterval = setInterval(tickProgress, 500);
-}
-
-function stopProgress() {
-  if (state.progressInterval) {
-    clearInterval(state.progressInterval);
-    state.progressInterval = null;
-  }
-}
-
-function tickProgress() {
-  // If YouTube is playing, use its actual position
-  let elapsed;
-  if (ytPlayer && ytPlayer.getCurrentTime && ytPlayer.getPlayerState && ytPlayer.getPlayerState() === 1) {
-    elapsed = ytPlayer.getCurrentTime();
-    const dur = ytPlayer.getDuration();
-    if (dur) state.songDuration = dur;
-  } else {
-    elapsed = (Date.now() - state.songStartTime) / 1000;
-  }
-
-  state.progress = Math.min((elapsed / state.songDuration) * 100, 100);
-
-  const fill = document.getElementById('progress-fill');
-  fill.style.width = state.progress + '%';
-
-  const elapsed_s = Math.floor(elapsed);
-  const m = Math.floor(elapsed_s / 60);
-  const s = elapsed_s % 60;
-  document.getElementById('progress-time').textContent = `${m}:${s.toString().padStart(2,'0')}`;
-
-  const total_m = Math.floor(state.songDuration / 60);
-  const total_s = Math.floor(state.songDuration % 60);
-  document.getElementById('progress-total').textContent = `${total_m}:${total_s.toString().padStart(2,'0')}`;
-
-  let pts = 0;
-  if (state.progress < 33) pts = 1;
-  else if (state.progress < 66) pts = 2;
-  else pts = 3;
-  document.getElementById('points-preview').textContent = `+${pts} pts if survived`;
-
-  if (state.progress >= 100) completeSong();
-}
-
-// ── COMPLETE SONG ─────────────────────────────────────────
-function completeSong() {
-  stopProgress();
-  if (!state.currentSong) return;
-
-  if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
-
-  const djPlayer = state.players.find(p => p.id === state.currentSong.submitterId);
-  if (djPlayer) {
-    djPlayer.score += 3;
-    toast(`${djPlayer.name}'s song played through! +3 pts`, 'green');
-  }
-
-  state.currentSong = null;
-  state.submissions = {};
-  state.progress = 0;
-
-  document.getElementById('no-song-state').style.display = 'flex';
-  document.getElementById('song-state').style.display = 'none';
-  document.getElementById('yt-player-wrap').style.display = 'none';
-  document.getElementById('album-art').style.display = 'flex';
-  document.getElementById('progress-fill').style.width = '0%';
-
-  updateStatusChip(false);
-  renderSubmitArea();
-  renderPlayerList();
-  renderTensionDots();
-}
-
-// ── HOST CONTROLS ─────────────────────────────────────────
-let hostPanelOpen = false;
-function toggleHostControls() {
-  hostPanelOpen = !hostPanelOpen;
-  document.getElementById('host-panel').style.display = hostPanelOpen ? 'block' : 'none';
-}
-
-function simulateProgress() {
-  if (!state.currentSong) {
-    // Auto-start a demo song
-    state.submissions['me'] = { link: 'https://open.spotify.com/track/demo', timestamp: Date.now() };
-    playSong('https://open.spotify.com/track/demo', 'me');
-    state.submissions = {};
-    renderSubmitArea();
-    renderPlayerList();
-    renderTensionDots();
-    return;
-  }
-  state.songStartTime -= (state.songDuration * 0.1 * 1000);
-  tickProgress();
-}
-
-function simulateOtherSubmit() {
-  const others = state.players.filter(p => p.id !== state.currentPlayer && !state.submissions[p.id]);
-  if (others.length === 0) { toast('All players have submitted', ''); return; }
-  const pick = others[Math.floor(Math.random() * others.length)];
-  state.submissions[pick.id] = { link: 'https://music.example.com/track/'+Math.random().toString(36).substr(2,6), timestamp: Date.now() };
-  toast(`${pick.name} locked in a pick`);
-  renderPlayerList();
-  renderTensionDots();
-
-  const majority = Math.ceil(state.players.length / 2);
-  if (Object.keys(state.submissions).length >= majority) {
-    setTimeout(() => triggerMajorityCut(), 800);
-  }
-}
-
-function forceMajority() {
-  const majority = Math.ceil(state.players.length / 2);
-  let added = 0;
-  for (const p of state.players) {
-    if (Object.keys(state.submissions).length >= majority) break;
-    if (!state.submissions[p.id]) {
-      state.submissions[p.id] = { link: 'https://music.example.com/'+p.id, timestamp: Date.now() + added };
-      added++;
-    }
-  }
-  renderPlayerList();
-  renderTensionDots();
-  setTimeout(() => triggerMajorityCut(), 800);
-}
-
-function resetRound() {
-  stopProgress();
-  if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
-  state.currentSong = null;
-  state.submissions = {};
-  state.progress = 0;
-  document.getElementById('no-song-state').style.display = 'flex';
-  document.getElementById('song-state').style.display = 'none';
-  document.getElementById('yt-player-wrap').style.display = 'none';
-  document.getElementById('album-art').style.display = 'flex';
-  document.getElementById('progress-fill').style.width = '0%';
-  updateStatusChip(false);
-  renderSubmitArea();
-  renderPlayerList();
-  renderTensionDots();
-  toast('Round reset');
-}
-
-// ── TOAST ─────────────────────────────────────────────────
-function toast(msg, type = '') {
-  const wrap = document.getElementById('toast-container');
-  const el = document.createElement('div');
-  el.className = `toast ${type}`;
-  el.textContent = msg;
-  wrap.appendChild(el);
-  setTimeout(() => el.remove(), 3000);
-}
 </script>
 </body>
 </html>
