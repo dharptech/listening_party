@@ -27,10 +27,11 @@
   function genCode() { return Math.random().toString(36).substring(2,7).toUpperCase(); }
 
   // ── SESSION PERSISTENCE ──
-  function saveSession() {
+  function saveSession(score) {
     localStorage.setItem('lp_session', JSON.stringify({
       roomCode: local.roomCode, playerId: local.playerId,
-      playerName: local.playerName, isHost: local.isHost
+      playerName: local.playerName, isHost: local.isHost,
+      score: score !== undefined ? score : (local.lastScore || 0)
     }));
   }
   function clearSession() { localStorage.removeItem('lp_session'); }
@@ -40,14 +41,30 @@
     if (!raw) return false;
     let session;
     try { session = JSON.parse(raw); } catch(e) { clearSession(); return false; }
-    const snap = await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).once('value');
-    if (!snap.exists()) { clearSession(); return false; }
+
+    // Check room still exists
+    const roomSnap = await db.ref(`rooms/${session.roomCode}`).once('value');
+    if (!roomSnap.exists()) { clearSession(); return false; }
+    const room = roomSnap.val();
+
     local.roomCode = session.roomCode;
     local.playerId = session.playerId;
     local.playerName = session.playerName;
-    local.isHost = session.isHost;
-    const roomSnap = await db.ref(`rooms/${session.roomCode}`).once('value');
-    if (roomSnap.exists()) local.isHost = roomSnap.val().hostId === local.playerId;
+    local.isHost = room.hostId === session.playerId;
+
+    // Re-write player slot if it was dropped (tab closed, onDisconnect fired, etc.)
+    const playerSnap = await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).once('value');
+    if (!playerSnap.exists()) {
+      // Restore player — pick a color not already taken
+      const players = room.players || {};
+      const taken = Object.values(players).map(p => p.color);
+      const color = COLORS.find(c => !taken.includes(c)) || COLORS[Math.floor(Math.random()*COLORS.length)];
+      await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).set({
+        name: session.playerName, score: session.score || 0, color,
+        joinedAt: firebase.database.ServerValue.TIMESTAMP
+      });
+    }
+
     initApp();
     toast('Reconnected ✓', 'green');
     return true;
@@ -153,6 +170,9 @@
 
   function renderPlayerList(players, submissions) {
     const sorted = Object.entries(players).sort((a,b) => b[1].score - a[1].score);
+    // Persist current score to localStorage
+    const myEntry = players[local.playerId];
+    if (myEntry) { local.lastScore = myEntry.score; saveSession(myEntry.score); }
     document.getElementById('player-list').innerHTML = sorted.map(([pid,p],i) => `
       <div class="player-row">
         <div class="player-rank">${i+1}</div>
