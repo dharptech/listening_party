@@ -714,7 +714,7 @@
 <body>
 <div id="landing">
   <div style="display:flex;align-items:center;gap:12px;">
-    <div class="wordmark">Listening Party</div>
+    <div class="wordmark">Listening Party <span style="font-size:10px;opacity:0.5;letter-spacing:0">v1.53</span></div>
     <button class="theme-btn" id="theme-toggle-landing" onclick="toggleTheme()" title="Toggle dark mode"></button>
   </div>
   <div class="landing-cards">
@@ -752,7 +752,7 @@
   <div class="app-shell">
     <div class="app-header">
       <div class="room-info">
-        <span class="wordmark">Listening Party</span>
+        <span class="wordmark">Listening Party <span style="font-size:10px;opacity:0.5;letter-spacing:0">v1.53</span></span>
         <span class="room-code" id="header-code"></span>
         <span class="share-hint">share this code to invite friends</span>
         <div id="status-chip-wrap"></div>
@@ -872,8 +872,10 @@
 
 <div class="interrupt-flash" id="interrupt-flash"></div>
 <div id="toast-container"></div>
-<a href="https://www.linkedin.com/in/duaneharper/" target="_blank" style="position:fixed;bottom:10px;left:14px;font-size:11px;color:var(--text-3);text-decoration:none;font-family:'DM Sans',sans-serif;z-index:9999;transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text-3)'">Imagined by Duane Harper</a>
-<div style="position:fixed;bottom:10px;right:14px;font-family:'DM Mono',monospace;font-size:11px;color:var(--text-3);z-index:9999;">v1.52</div>
+<div style="width:100%;text-align:center;padding:24px 0 16px;font-size:11px;">
+  <a href="https://www.linkedin.com/in/duaneharper/" target="_blank" style="color:var(--text-3);text-decoration:none;font-family:'DM Sans',sans-serif;transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text-3)'">Imagined by Duane Harper</a>
+</div>
+
 
 <script>
   // ── THEME ──
