@@ -591,7 +591,7 @@
     const wrap = document.getElementById('toast-container');
     const el = document.createElement('div');
     el.className=`toast ${type}`; el.textContent=msg;
-    wrap.appendChild(el); setTimeout(()=>el.remove(),3000);
+    wrap.appendChild(el); setTimeout(()=>el.remove(),10000);
   };
 </script>
 <style>
@@ -689,7 +689,7 @@
   .dot-blink{width:6px;height:6px;border-radius:50%;background:currentColor;animation:blink 1.2s ease-in-out infinite}
   @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
   #toast-container{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;gap:8px;z-index:100;pointer-events:none}
-  .toast{background:var(--text);color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;white-space:nowrap;animation:toast-in .2s ease,toast-out .3s ease 2.5s forwards}
+  .toast{background:var(--text);color:#fff;padding:10px 18px;border-radius:8px;font-size:13px;white-space:nowrap;animation:toast-in .2s ease,toast-out 4s ease 6s forwards}
   .toast.green{background:var(--green)}.toast.red{background:var(--red)}
   @keyframes toast-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
   @keyframes toast-out{from{opacity:1}to{opacity:0}}
@@ -714,7 +714,7 @@
 <body>
 <div id="landing">
   <div style="display:flex;align-items:center;gap:12px;">
-    <div class="wordmark">Listening Party <span style="font-size:10px;opacity:0.5;letter-spacing:0">v1.54</span></div>
+    <div class="wordmark">Listening Party <span style="font-size:10px;opacity:0.5;letter-spacing:0">v1.55</span></div>
     <button class="theme-btn" id="theme-toggle-landing" onclick="toggleTheme()" title="Toggle dark mode"></button>
   </div>
   <div class="landing-cards">
@@ -752,7 +752,7 @@
   <div class="app-shell">
     <div class="app-header">
       <div class="room-info">
-        <span class="wordmark">Listening Party <span style="font-size:10px;opacity:0.5;letter-spacing:0">v1.54</span></span>
+        <span class="wordmark">Listening Party <span style="font-size:10px;opacity:0.5;letter-spacing:0">v1.55</span></span>
         <span class="room-code" id="header-code"></span>
         <span class="share-hint">share this code to invite friends</span>
         <div id="status-chip-wrap"></div>
