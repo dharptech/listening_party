@@ -26,6 +26,25 @@
   function genId() { return Math.random().toString(36).substring(2,10); }
   function genCode() { return Math.random().toString(36).substring(2,7).toUpperCase(); }
 
+  // ── ROOM CLEANUP ──
+  async function sweepOldRooms() {
+    const cutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
+    const snap = await db.ref('rooms').once('value');
+    if (!snap.exists()) return;
+    const rooms = snap.val();
+    const deletes = [];
+    for (const [code, room] of Object.entries(rooms)) {
+      if (room.createdAt && room.createdAt < cutoff) {
+        deletes.push(db.ref(`rooms/${code}`).remove());
+      }
+    }
+    if (deletes.length) {
+      await Promise.all(deletes);
+      console.log(`Swept ${deletes.length} old room(s)`);
+    }
+  }
+  sweepOldRooms();
+
   // ── SESSION PERSISTENCE ──
   function saveSession(score) {
     localStorage.setItem('lp_session', JSON.stringify({
@@ -56,17 +75,18 @@
     local.hostOnly = room.hostOnly || session.hostOnly || false;
     local.isRemote = session.isRemote || false;
 
-    // Re-write player slot if it was dropped (tab closed, onDisconnect fired, etc.)
-    const playerSnap = await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).once('value');
-    if (!playerSnap.exists()) {
-      // Restore player — pick a color not already taken
-      const players = room.players || {};
-      const taken = Object.values(players).map(p => p.color);
-      const color = COLORS.find(c => !taken.includes(c)) || COLORS[Math.floor(Math.random()*COLORS.length)];
-      await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).set({
-        name: session.playerName, score: session.score || 0, color,
-        joinedAt: firebase.database.ServerValue.TIMESTAMP
-      });
+    // Re-write player slot if it was dropped — but not for host-only sessions
+    if (!local.hostOnly) {
+      const playerSnap = await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).once('value');
+      if (!playerSnap.exists()) {
+        const players = room.players || {};
+        const taken = Object.values(players).map(p => p.color);
+        const color = COLORS.find(c => !taken.includes(c)) || COLORS[Math.floor(Math.random()*COLORS.length)];
+        await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).set({
+          name: session.playerName, score: session.score || 0, color,
+          joinedAt: firebase.database.ServerValue.TIMESTAMP
+        });
+      }
     }
 
     initApp();
@@ -178,6 +198,24 @@
     }
   })();
 
+  // ── ROOM CLEANUP ──
+  async function cleanupOldRooms() {
+    try {
+      const snap = await db.ref('rooms').once('value');
+      if (!snap.exists()) return;
+      const cutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours
+      const deletions = [];
+      snap.forEach(child => {
+        const room = child.val();
+        if (room.createdAt && room.createdAt < cutoff) {
+          deletions.push(db.ref('rooms/' + child.key).remove());
+        }
+      });
+      if (deletions.length) await Promise.all(deletions);
+    } catch(e) { /* silent fail */ }
+  }
+  cleanupOldRooms();
+
   tryAutoReconnect();
 
   // ── SUBSCRIBE ──
@@ -189,7 +227,11 @@
     db.ref(`rooms/${local.roomCode}`).on('value', snap => {
       if (!snap.exists()) return;
       const room = snap.val();
-      const players = room.players || {};
+      const allPlayers = room.players || {};
+      // In host-only mode, filter the host out of the player list entirely
+      const players = room.hostOnly
+        ? Object.fromEntries(Object.entries(allPlayers).filter(([pid]) => pid !== room.hostId))
+        : allPlayers;
       const submissions = room.submissions || {};
       const song = room.currentSong || null;
 
@@ -517,6 +559,14 @@
   }
 
   // ── HOST CONTROLS ──
+  window.hostEndRoom = async function() {
+    if (!local.isHost) return;
+    if (!confirm('End the room for everyone? This cannot be undone.')) return;
+    await db.ref(`rooms/${local.roomCode}`).remove();
+    clearSession();
+    location.reload();
+  };
+
   window.hostSkipSong = async function() {
     if (!local.isHost) return;
     await db.ref(`rooms/${local.roomCode}`).update({ currentSong:null, songStartedAt:null, submissions:null });
@@ -534,6 +584,7 @@
     await db.ref(`rooms/${local.roomCode}/players`).update(updates);
     toast('Scores reset');
   };
+
 
   // ── TOAST ──
   window.toast = function(msg, type='') {
@@ -780,6 +831,7 @@
       <div class="host-actions">
         <button class="btn btn-outline btn-sm" onclick="hostSkipSong()">⏭ Skip song</button>
         <button class="btn btn-outline btn-sm" onclick="hostResetScores()">↺ Reset scores</button>
+        <button class="btn btn-outline btn-sm" onclick="hostEndRoom()" style="color:var(--red);border-color:var(--red)">✕ End room</button>
       </div>
     </div>
 
@@ -821,7 +873,7 @@
 <div class="interrupt-flash" id="interrupt-flash"></div>
 <div id="toast-container"></div>
 <a href="https://www.linkedin.com/in/duaneharper/" target="_blank" style="position:fixed;bottom:10px;left:14px;font-size:11px;color:var(--text-3);text-decoration:none;font-family:'DM Sans',sans-serif;z-index:9999;transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text-3)'">Imagined by Duane Harper</a>
-<div style="position:fixed;bottom:10px;right:14px;font-family:'DM Mono',monospace;font-size:11px;color:var(--text-3);z-index:9999;">v1.5</div>
+<div style="position:fixed;bottom:10px;right:14px;font-family:'DM Mono',monospace;font-size:11px;color:var(--text-3);z-index:9999;">v1.52</div>
 
 <script>
   // ── THEME ──
