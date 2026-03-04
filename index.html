@@ -31,6 +31,7 @@
     localStorage.setItem('lp_session', JSON.stringify({
       roomCode: local.roomCode, playerId: local.playerId,
       playerName: local.playerName, isHost: local.isHost,
+      hostOnly: local.hostOnly || false,
       score: score !== undefined ? score : (local.lastScore || 0)
     }));
   }
@@ -51,6 +52,7 @@
     local.playerId = session.playerId;
     local.playerName = session.playerName;
     local.isHost = room.hostId === session.playerId;
+    local.hostOnly = room.hostOnly || session.hostOnly || false;
 
     // Re-write player slot if it was dropped (tab closed, onDisconnect fired, etc.)
     const playerSnap = await db.ref(`rooms/${session.roomCode}/players/${session.playerId}`).once('value');
@@ -72,15 +74,19 @@
 
   // ── LANDING ──
   window.hostRoom = async function() {
-    const name = document.getElementById('host-name').value.trim();
-    if (!name) { toast('Enter your name first','red'); return; }
+    const hostOnly = document.getElementById('host-only-toggle').checked;
+    const name = hostOnly ? '__host__' : document.getElementById('host-name').value.trim();
+    if (!hostOnly && !name) { toast('Enter your name first','red'); return; }
     const code = genCode();
     const pid = genId();
-    local.roomCode = code; local.playerId = pid; local.playerName = name; local.isHost = true;
-    await db.ref(`rooms/${code}`).set({ code, hostId:pid, createdAt: firebase.database.ServerValue.TIMESTAMP, currentSong:null, songStartedAt:null });
-    await db.ref(`rooms/${code}/players/${pid}`).set({ name, score:0, color:COLORS[0], joinedAt: firebase.database.ServerValue.TIMESTAMP });
+    local.roomCode = code; local.playerId = pid; local.playerName = name;
+    local.isHost = true; local.hostOnly = hostOnly;
+    await db.ref(`rooms/${code}`).set({ code, hostId:pid, hostOnly: hostOnly, createdAt: firebase.database.ServerValue.TIMESTAMP, currentSong:null, songStartedAt:null });
+    // Only add host to player list if not host-only mode
+    if (!hostOnly) {
+      await db.ref(`rooms/${code}/players/${pid}`).set({ name, score:0, color:COLORS[0], joinedAt: firebase.database.ServerValue.TIMESTAMP });
+    }
     saveSession();
-    // Update URL with room code for easy sharing
     window.history.replaceState({}, '', `?room=${code}`);
     initApp();
   };
@@ -101,6 +107,11 @@
     saveSession();
     window.history.replaceState({}, '', `?room=${code}`);
     initApp();
+  };
+
+  window.toggleHostOnly = function(checked) {
+    const nameField = document.getElementById('host-name');
+    nameField.style.display = checked ? 'none' : 'block';
   };
 
   window.copyLink = function() {
@@ -136,6 +147,13 @@
     if (local.isHost) document.getElementById('host-btn').style.display = 'inline-flex';
     document.getElementById('leave-btn').style.display = 'inline-flex';
     document.getElementById('copy-link-btn').style.display = 'inline-flex';
+
+    if (local.hostOnly) {
+      document.getElementById('sidebar').style.display = 'none';
+      document.getElementById('host-only-leaderboard').style.display = 'block';
+      document.querySelector('.app-shell').classList.add('host-only-mode');
+    }
+
     subscribeToRoom();
     initYouTube();
   }
@@ -218,10 +236,9 @@
 
   function renderPlayerList(players) {
     const sorted = Object.entries(players).sort((a,b) => b[1].score - a[1].score);
-    // Persist current score to localStorage
     const myEntry = players[local.playerId];
     if (myEntry) { local.lastScore = myEntry.score; saveSession(myEntry.score); }
-    document.getElementById('player-list').innerHTML = sorted.map(([pid,p],i) => `
+    const html = sorted.map(([pid,p],i) => `
       <div class="player-row">
         <div class="player-rank">${i+1}</div>
         <div class="avatar-sm" style="background:${p.color}">${p.name[0].toUpperCase()}</div>
@@ -229,6 +246,10 @@
         <div class="player-score">${p.score}</div>
         ${local.isHost && pid !== local.playerId ? `<button class="remove-btn" onclick="hostRemovePlayer('${pid}')">✕</button>` : ''}
       </div>`).join('');
+    const el1 = document.getElementById('player-list');
+    if (el1) el1.innerHTML = html;
+    const el2 = document.getElementById('player-list-host-only');
+    if (el2) el2.innerHTML = html;
   }
 
   window.hostRemovePlayer = async function(pid) {
@@ -240,6 +261,7 @@
 
 
   function renderSubmitArea(submissions) {
+    if (local.hostOnly) return; // host-only: no submit UI
     const mine = submissions[local.playerId];
     document.getElementById('submit-area').style.display = mine ? 'none' : 'flex';
     document.getElementById('submitted-state').style.display = mine ? 'flex' : 'none';
@@ -594,6 +616,14 @@
   .theme-btn{background:var(--text);border:2px solid var(--text);cursor:pointer;width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;padding:0;transition:background .2s,border-color .2s;flex-shrink:0}
   .theme-btn:hover{opacity:.85}
   .theme-btn svg{width:15px;height:15px;fill:var(--bg);stroke:var(--bg);display:block}
+  .host-only-mode{grid-template-columns:1fr !important}
+  .toggle-row{margin-bottom:10px}
+  .toggle-label{display:flex;align-items:center;gap:10px;cursor:pointer;font-size:13px;color:var(--text-2);user-select:none}
+  .toggle-label input[type=checkbox]{display:none}
+  .toggle-track{width:36px;height:20px;background:var(--border);border-radius:10px;position:relative;transition:background .2s;flex-shrink:0}
+  .toggle-thumb{position:absolute;top:3px;left:3px;width:14px;height:14px;background:var(--surface);border-radius:50%;transition:transform .2s,background .2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+  .toggle-label input:checked + .toggle-track{background:var(--text)}
+  .toggle-label input:checked + .toggle-track .toggle-thumb{transform:translateX(16px)}
   .host-panel{grid-column:1/-1;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px}
   .host-panel h3{font-size:13px;font-weight:500;margin-bottom:12px}
   .host-actions{display:flex;gap:8px;flex-wrap:wrap}
@@ -616,13 +646,20 @@
 <body>
 <div id="landing">
   <div style="display:flex;align-items:center;gap:12px;">
-    <div class="wordmark">Listening Party <span style="font-size:10px;opacity:0.6;">v1.06</span></div>
+    <div class="wordmark">Listening Party</div>
     <button class="theme-btn" id="theme-toggle-landing" onclick="toggleTheme()" title="Toggle dark mode"></button>
   </div>
   <div class="landing-cards">
     <div class="card">
       <h2>Host a room</h2>
       <p>Start a session and share the room code with friends.</p>
+      <div class="toggle-row" id="host-only-row">
+        <label class="toggle-label">
+          <input type="checkbox" id="host-only-toggle" onchange="toggleHostOnly(this.checked)" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span>Host only <span style="color:var(--text-3);font-size:12px;">— dedicated speaker device</span></span>
+        </label>
+      </div>
       <input type="text" id="host-name" placeholder="Your name" />
       <button class="btn btn-dark" onclick="hostRoom()">Create room →</button>
     </div>
@@ -640,7 +677,7 @@
   <div class="app-shell">
     <div class="app-header">
       <div class="room-info">
-        <span class="wordmark">Listening Party <span style="font-size:10px;opacity:0.6;">v1.06</span></span>
+        <span class="wordmark">Listening Party</span>
         <span class="room-code" id="header-code"></span>
         <span class="share-hint">share this code to invite friends</span>
         <div id="status-chip-wrap"></div>
@@ -687,7 +724,15 @@
       </div>
     </div>
 
-    <div class="sidebar">
+    <!-- HOST-ONLY leaderboard shown below now-playing in host-only mode -->
+    <div id="host-only-leaderboard" style="display:none;grid-column:1/-1;">
+      <div class="leaderboard">
+        <div class="section-label">Players</div>
+        <div id="player-list-host-only"><div style="color:var(--text-3);font-size:13px;padding:12px 0">Waiting for players…</div></div>
+      </div>
+    </div>
+
+    <div class="sidebar" id="sidebar">
       <div class="my-submission">
         <div class="section-label">My pick</div>
         <div class="submit-area" id="submit-area">
@@ -718,6 +763,8 @@
 
 <div class="interrupt-flash" id="interrupt-flash"></div>
 <div id="toast-container"></div>
+<a href="https://www.linkedin.com/in/duaneharper/" target="_blank" style="position:fixed;bottom:10px;left:14px;font-size:11px;color:var(--text-3);text-decoration:none;font-family:'DM Sans',sans-serif;z-index:9999;transition:color .15s" onmouseover="this.style.color='var(--text)'" onmouseout="this.style.color='var(--text-3)'">Imagined by Duane Harper</a>
+<div style="position:fixed;bottom:10px;right:14px;font-family:'DM Mono',monospace;font-size:11px;color:var(--text-3);z-index:9999;">v1.08</div>
 
 <script>
   // ── THEME ──
