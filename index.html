@@ -7,6 +7,7 @@
 <script src="https://www.youtube.com/iframe_api"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
 <script>
   firebase.initializeApp({
     apiKey: "AIzaSyDOthR_3Wm0r0olsYu1o-miRvoyI5Jj9Ho",
@@ -18,32 +19,14 @@
     appId: "1:501794449158:web:8e90c4d8ef804b1e4ee087"
   });
   const db = firebase.database();
+  const auth = firebase.auth();
 
   const COLORS = ['#2d6a4f','#1a4a8a','#7b2d8b','#b45309','#c0392b','#1a7a6e','#5a3e8a','#8a5c1a'];
   const local = { roomCode:null, playerId:null, playerName:null, isHost:false, progress:0, songDuration:210, songStartTime:null, progressInterval:null, pendingVideoId:null };
 
   function rref(path) { return db.ref(path ? `rooms/${local.roomCode}/${path}` : `rooms/${local.roomCode}`); }
-  function genId() { return Math.random().toString(36).substring(2,10); }
   function genCode() { return Math.random().toString(36).substring(2,7).toUpperCase(); }
 
-  // ── ROOM CLEANUP ──
-  async function sweepOldRooms() {
-    const cutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
-    const snap = await db.ref('rooms').once('value');
-    if (!snap.exists()) return;
-    const rooms = snap.val();
-    const deletes = [];
-    for (const [code, room] of Object.entries(rooms)) {
-      if (room.createdAt && room.createdAt < cutoff) {
-        deletes.push(db.ref(`rooms/${code}`).remove());
-      }
-    }
-    if (deletes.length) {
-      await Promise.all(deletes);
-      console.log(`Swept ${deletes.length} old room(s)`);
-    }
-  }
-  sweepOldRooms();
 
   // ── SESSION PERSISTENCE ──
   function saveSession(score) {
@@ -67,6 +50,12 @@
     const roomSnap = await db.ref(`rooms/${session.roomCode}`).once('value');
     if (!roomSnap.exists()) { clearSession(); return false; }
     const room = roomSnap.val();
+
+    // Migration guard: old sessions used genId() short strings, new ones use Firebase UIDs
+    if (session.playerId !== auth.currentUser.uid) {
+      clearSession();
+      return false;
+    }
 
     local.roomCode = session.roomCode;
     local.playerId = session.playerId;
@@ -100,7 +89,7 @@
     const name = hostOnly ? '__host__' : document.getElementById('host-name').value.trim();
     if (!hostOnly && !name) { toast('Enter your name first','red'); return; }
     const code = genCode();
-    const pid = genId();
+    const pid = auth.currentUser.uid;
     local.roomCode = code; local.playerId = pid; local.playerName = name;
     local.isHost = true; local.hostOnly = hostOnly;
     await db.ref(`rooms/${code}`).set({ code, hostId:pid, hostOnly: hostOnly, createdAt: firebase.database.ServerValue.TIMESTAMP, currentSong:null, songStartedAt:null });
@@ -121,7 +110,7 @@
     if (!code) { toast('Enter a room code','red'); return; }
     const snap = await db.ref(`rooms/${code}`).once('value');
     if (!snap.exists()) { toast('Room not found — check the code','red'); return; }
-    const pid = genId();
+    const pid = auth.currentUser.uid;
     local.roomCode = code; local.playerId = pid; local.playerName = name;
     local.isHost = false; local.isRemote = remote;
     const players = snap.val().players || {};
@@ -214,9 +203,17 @@
       if (deletions.length) await Promise.all(deletions);
     } catch(e) { /* silent fail */ }
   }
-  cleanupOldRooms();
 
-  tryAutoReconnect();
+  // ── AUTH STARTUP ──
+  // Sign in anonymously before touching the database.
+  // onAuthStateChanged fires once on load — restores an existing anonymous session
+  // if one exists, or mints a new one. Unsubscribes immediately after first fire.
+  const _authUnsub = auth.onAuthStateChanged(async (user) => {
+    _authUnsub();
+    if (!user) await auth.signInAnonymously();
+    cleanupOldRooms();
+    tryAutoReconnect();
+  });
 
   // ── SUBSCRIBE ──
   let prevSongKey = null;
