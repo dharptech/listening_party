@@ -169,28 +169,43 @@ async function cmdCheck() {
   const bobHasPick   = !!submissions[uid];
   const humansPicked = Object.keys(submissions).filter(p => p !== uid).length > 0;
   const playerCount  = Object.keys(players).length;
-  const cutThreshold = Math.ceil(playerCount / 2);
   const bobIsDj      = song?.submitterId === uid;
-  // Bob submitting while a song plays would instantly cut if his 1 submission
-  // meets the threshold — happens when playerCount <= 2
-  const bobWouldInstantCut = song && !bobIsDj && cutThreshold <= 1;
 
-  console.log(`\n${bar}`);
-  if (bobHasPick) {
-    console.log(`  ✓  Bob is queued up. Waiting.`);
-  } else if (humansPicked) {
-    console.log(`  ✓  Humans have this covered. Bob can chill.`);
-  } else if (!song) {
-    console.log(`  ⚠  BOB SHOULD PICK — queue is cold, no song playing`);
-  } else if (bobIsDj) {
-    console.log(`  ✓  Bob is the DJ right now — sit tight, don't self-cut`);
-  } else if (bobWouldInstantCut) {
-    console.log(`  ⚠  Only ${playerCount} players — Bob submitting would instantly cut the current song`);
-    console.log(`     Wait for more players or for the song to end naturally`);
-  } else {
-    console.log(`  ✓  ${playerCount} players, cut threshold is ${cutThreshold} — Bob can safely queue a backup`);
-    console.log(`  ⚠  BOB SHOULD PICK`);
+  // Auto-clear Bob's pick the moment any human submits — Bob is a gap filler,
+  // not a competitor. If humans are engaged, Bob steps back.
+  if (bobHasPick && humansPicked) {
+    await dbDelete(`rooms/${roomCode}/submissions/${uid}`, idToken);
+    console.log(`\n${bar}`);
+    console.log(`  ↩  A human submitted — Bob withdrew his pick`);
+    console.log(`     Bob says: "The crowd stirs. I'll let them fight it out."`);
+    console.log(`${bar}\n`);
+    return;
   }
+
+  // Commentary + action verdict
+  console.log(`\n${bar}`);
+
+  if (!song) {
+    if (!bobHasPick && !humansPicked) {
+      console.log(`  ⚠  ACTION: BOB SHOULD PICK`);
+      console.log(`     Bob says: "The silence is becoming a personal insult."`);
+    } else if (bobHasPick) {
+      console.log(`  ✓  Bob is queued — waiting for the room to catch up`);
+      console.log(`     Bob says: "Something is coming. I have opinions."`);
+    }
+  } else if (bobIsDj) {
+    console.log(`  ✓  Bob's track is on — sit tight`);
+    console.log(`     Bob says: "You're welcome. Try to keep up."`);
+  } else if (humansPicked) {
+    console.log(`  ✓  Humans are engaged — Bob stays out of it`);
+    console.log(`     Bob says: "The room has opinions. Interesting."`);
+  } else {
+    // Song playing, no submissions, Bob is not DJ — Bob stays quiet.
+    // His job is to fill gaps, not influence cuts.
+    console.log(`  ✓  Song is playing — Bob is listening, not interfering`);
+    console.log(`     Bob says: "Let it breathe. I'll be here if it all falls apart."`);
+  }
+
   console.log(`${bar}\n`);
 }
 
