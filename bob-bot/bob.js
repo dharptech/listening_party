@@ -168,14 +168,28 @@ async function cmdCheck() {
   // Verdict
   const bobHasPick   = !!submissions[uid];
   const humansPicked = Object.keys(submissions).filter(p => p !== uid).length > 0;
+  const playerCount  = Object.keys(players).length;
+  const cutThreshold = Math.ceil(playerCount / 2);
+  const bobIsDj      = song?.submitterId === uid;
+  // Bob submitting while a song plays would instantly cut if his 1 submission
+  // meets the threshold — happens when playerCount <= 2
+  const bobWouldInstantCut = song && !bobIsDj && cutThreshold <= 1;
 
   console.log(`\n${bar}`);
-  if (!bobHasPick && !humansPicked) {
-    console.log(`  ⚠  BOB SHOULD PICK — nothing is queued`);
-  } else if (bobHasPick) {
+  if (bobHasPick) {
     console.log(`  ✓  Bob is queued up. Waiting.`);
+  } else if (humansPicked) {
+    console.log(`  ✓  Humans have this covered. Bob can chill.`);
+  } else if (!song) {
+    console.log(`  ⚠  BOB SHOULD PICK — queue is cold, no song playing`);
+  } else if (bobIsDj) {
+    console.log(`  ✓  Bob is the DJ right now — sit tight, don't self-cut`);
+  } else if (bobWouldInstantCut) {
+    console.log(`  ⚠  Only ${playerCount} players — Bob submitting would instantly cut the current song`);
+    console.log(`     Wait for more players or for the song to end naturally`);
   } else {
-    console.log(`  ✓  Humans have this. Bob can chill.`);
+    console.log(`  ✓  ${playerCount} players, cut threshold is ${cutThreshold} — Bob can safely queue a backup`);
+    console.log(`  ⚠  BOB SHOULD PICK`);
   }
   console.log(`${bar}\n`);
 }
