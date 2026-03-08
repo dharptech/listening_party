@@ -4,14 +4,19 @@
 // Commands:
 //   node bob.js join <ROOM_CODE>    Bob enters the room
 //   node bob.js check               What's happening right now
+//   node bob.js find "Artist Song"  Find a music.youtube.com link
 //   node bob.js submit <URL>        Bob queues a song
 //   node bob.js clear               Bob withdraws his current pick
 //   node bob.js leave               Bob leaves gracefully
 
 import 'dotenv/config';
 import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'fs';
-import { homedir } from 'os';
-import { join }    from 'path';
+import { homedir }   from 'os';
+import { join }      from 'path';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const yts     = require('yt-search');
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -197,6 +202,35 @@ async function cmdClear() {
   console.log(`Bob withdrew his pick.`);
 }
 
+// ── find ─────────────────────────────────────────────────────────────────────
+
+// Searches YouTube preferring official audio, returns a music.youtube.com link.
+async function findMusicUrl(query) {
+  // Try "official audio" first — these tend to be audio-only on YT Music
+  const audioResults = await yts(`${query} official audio`);
+  const audioHit     = audioResults.videos.find(v =>
+    /official.audio|[\(\[]audio[\)\]]/i.test(v.title)
+  );
+
+  // Fall back to plain search if no clear audio hit
+  const generalResults = await yts(query);
+  const video = audioHit || generalResults.videos[0];
+
+  if (!video) throw new Error(`Nothing found for: ${query}`);
+
+  // Convert to music.youtube.com — same video ID, better experience
+  const url = `https://music.youtube.com/watch?v=${video.videoId}`;
+  return { url, title: video.title, author: video.author?.name };
+}
+
+async function cmdFind(query) {
+  if (!query) { console.error('Usage: node bob.js find "Artist Song Title"'); process.exit(1); }
+  const { url, title, author } = await findMusicUrl(query);
+  console.log(`\n  ${title}`);
+  console.log(`  ${author}`);
+  console.log(`  ${url}\n`);
+}
+
 // ── leave ────────────────────────────────────────────────────────────────────
 
 async function cmdLeave() {
@@ -217,16 +251,18 @@ if (typeof fetch === 'undefined') {
 const [,, cmd, arg] = process.argv;
 
 switch (cmd) {
-  case 'join':   await cmdJoin(arg);   break;
-  case 'check':  await cmdCheck();     break;
-  case 'submit': await cmdSubmit(arg); break;
-  case 'clear':  await cmdClear();     break;
-  case 'leave':  await cmdLeave();     break;
+  case 'join':   await cmdJoin(arg);          break;
+  case 'check':  await cmdCheck();            break;
+  case 'find':   await cmdFind(process.argv.slice(3).join(' ')); break;
+  case 'submit': await cmdSubmit(arg);        break;
+  case 'clear':  await cmdClear();            break;
+  case 'leave':  await cmdLeave();            break;
   default:
     console.log('\nUsage:');
-    console.log('  node bob.js join <ROOM_CODE>   — Bob enters the room');
-    console.log('  node bob.js check              — Read current room state');
-    console.log('  node bob.js submit <URL>       — Queue a song');
-    console.log('  node bob.js clear              — Withdraw Bob\'s current pick');
-    console.log('  node bob.js leave              — Bob leaves gracefully\n');
+    console.log('  node bob.js join <ROOM_CODE>        — Bob enters the room');
+    console.log('  node bob.js check                   — Read current room state');
+    console.log('  node bob.js find "Artist Song"      — Find a music.youtube.com link');
+    console.log('  node bob.js submit <URL>            — Queue a song');
+    console.log('  node bob.js clear                   — Withdraw Bob\'s current pick');
+    console.log('  node bob.js leave                   — Bob leaves gracefully\n');
 }
