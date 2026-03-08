@@ -22,7 +22,7 @@ const yts     = require('yt-search');
 
 const DB_URL    = process.env.FIREBASE_DATABASE_URL;
 const API_KEY   = process.env.FIREBASE_API_KEY;
-const BOB_NAME  = 'Bob 🎱';
+const BOB_NAME  = 'Bob 💀';
 const BOB_COLOR = '#6b21a8'; // ancient purple
 const SESSION   = join(homedir(), '.bob-session.json'); // lives outside the repo
 
