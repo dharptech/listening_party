@@ -16,9 +16,9 @@ import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import Anthropic from '@anthropic-ai/sdk';
 import { createRequire } from 'module';
 
-// ytsr is CommonJS-only, so we load it via createRequire
+// yt-search is CommonJS-only, so we load it via createRequire
 const require = createRequire(import.meta.url);
-const ytsr = require('ytsr');
+const yts = require('yt-search');
 
 // ── STARTUP CHECK ──────────────────────────────────────────────────────────
 
@@ -265,8 +265,8 @@ Respond ONLY with valid JSON — no markdown, no explanation, just the JSON obje
 
 async function findOnYouTube(artist, title) {
   const query   = `${artist} ${title}`;
-  const results = await ytsr(query, { limit: 5 });
-  const video   = results.items.find(item => item.type === 'video' && !item.isLive);
+  const results = await yts(query);
+  const video   = results.videos[0];
 
   if (!video) {
     throw new Error(`No YouTube video found for: ${query}`);

@@ -11,6 +11,6 @@
     "@anthropic-ai/sdk": "^0.52.0",
     "dotenv": "^16.0.0",
     "firebase": "^9.23.0",
-    "ytsr": "^3.9.1"
+    "yt-search": "^2.13.1"
   }
 }
